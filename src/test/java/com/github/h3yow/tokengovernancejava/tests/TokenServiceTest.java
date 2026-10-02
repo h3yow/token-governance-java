@@ -104,7 +104,7 @@ class TokenServiceTest {
     }
 
     @Test
-    void replayed_refresh_token_is_rejected_as_consumed() {
+    void replayed_refresh_token_after_rotation_revokes_session_as_replay() throws Exception {
         MutableClock clock = new MutableClock(1_000_000L);
         TokenService svc = serviceAt(0, clock);
         TokenPair first = svc.issue("carol");
@@ -112,13 +112,22 @@ class TokenServiceTest {
 
         TokenPair second = svc.rotate(oldRefresh);
         assertNotNull(second);
-        log.info("[重放] 首次旋转成功 旧refresh={} 新refresh={}", oldRefresh,
-                second.refreshToken().getId());
+        log.info("[重放] 首次旋转成功 旧refresh={} 新refresh={} 新access={}",
+                oldRefresh, second.refreshToken().getId(), second.accessToken().getId());
 
+        // 越过“并发首用竞争”宽限窗口后再次出现同一张已消费刷新凭证 => 事后重放，
+        // 区别于并发抢输：判 REPLAY_DETECTED 并作废整个会话。
+        Thread.sleep(700L);
         TokenException ex = assertThrows(TokenException.class, () -> svc.rotate(oldRefresh));
-        assertEquals(RejectionReason.ALREADY_CONSUMED, ex.getReason());
+        assertEquals(RejectionReason.REPLAY_DETECTED, ex.getReason());
         log.info("[重放] 再次使用旧 refresh={} 被拒绝 reason={} msg={}",
                 oldRefresh, ex.getReason(), ex.getMessage());
+
+        // 连第一次旋转换出的新 access 也立即失效。
+        TokenException accessEx = assertThrows(TokenException.class,
+                () -> svc.validateAccess(second.accessToken().getId()));
+        assertEquals(RejectionReason.REVOKED, accessEx.getReason());
+        log.info("[重放] 旋转新 access 已随会话作废 reason={}", accessEx.getReason());
     }
 
     @Test

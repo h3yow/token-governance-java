@@ -22,6 +22,12 @@ public final class Token {
     private final long expiresAt;
     private final AtomicReference<TokenState> state;
 
+    /** 赢家完成 ACTIVE -> CONSUMED 抢占的真实时刻（{@code System.nanoTime()}，0 表示尚未消费）。 */
+    private volatile long consumedAtNanos;
+
+    /** 旋转是否已整体完成（登记新成员并收尾）。进入旋转前为 false 表示“仍有首用机会”。 */
+    private volatile boolean rotationClosed;
+
     public Token(String id, TokenType type, String subject, String familyId,
                  long issuedAt, long expiresAt, TokenState state) {
         this.id = id;
@@ -70,6 +76,22 @@ public final class Token {
      * 用于并发旋转时 ACTIVE -> CONSUMED 的抢占，保证同一刷新凭证最多成功一次。
      */
     public boolean casState(TokenState expected, TokenState update) {
-        return state.compareAndSet(expected, update);
+        boolean ok = state.compareAndSet(expected, update);
+        if (ok) {
+            consumedAtNanos = System.nanoTime();
+        }
+        return ok;
+    }
+
+    public long getConsumedAtNanos() {
+        return consumedAtNanos;
+    }
+
+    public boolean isRotationClosed() {
+        return rotationClosed;
+    }
+
+    public void setRotationClosed(boolean closed) {
+        this.rotationClosed = closed;
     }
 }
