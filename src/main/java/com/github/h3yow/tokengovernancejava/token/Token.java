@@ -21,6 +21,8 @@ public final class Token {
     private final long issuedAt;
     private final long expiresAt;
     private final AtomicReference<TokenState> state;
+    /** 被消费（旋转成功）的时刻；-1 表示尚未消费。用于区分并发抢输与事后重放。 */
+    private volatile long consumedAt = -1L;
 
     public Token(String id, TokenType type, String subject, String familyId,
                  long issuedAt, long expiresAt, TokenState state) {
@@ -71,5 +73,15 @@ public final class Token {
      */
     public boolean casState(TokenState expected, TokenState update) {
         return state.compareAndSet(expected, update);
+    }
+
+    /** 被消费的时刻（毫秒），未消费为 -1。 */
+    public long getConsumedAt() {
+        return consumedAt;
+    }
+
+    /** 记录消费时刻；须在持有家族锁的旋转临界区内调用。 */
+    public void markConsumed(long consumedAtMillis) {
+        this.consumedAt = consumedAtMillis;
     }
 }

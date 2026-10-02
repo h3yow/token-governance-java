@@ -1,6 +1,7 @@
 package com.github.h3yow.tokengovernancejava.web;
 
 import com.github.h3yow.tokengovernancejava.authz.AuthorizationException;
+import com.github.h3yow.tokengovernancejava.session.SessionException;
 import com.github.h3yow.tokengovernancejava.token.RejectionReason;
 import com.github.h3yow.tokengovernancejava.token.TokenException;
 import com.github.h3yow.tokengovernancejava.web.dto.ErrorResponse;
@@ -22,6 +23,16 @@ public class GovernanceExceptionHandler {
             case ALREADY_CONSUMED, REPLAY_DETECTED -> HttpStatus.CONFLICT;
         };
         // error 字段直接携带可区分的拒绝原因，便于调用方归因。
+        return ResponseEntity.status(status)
+                .body(new ErrorResponse(ex.getReason().name(), ex.getMessage()));
+    }
+
+    @ExceptionHandler(SessionException.class)
+    public ResponseEntity<ErrorResponse> handleSession(SessionException ex) {
+        HttpStatus status = switch (ex.getReason()) {
+            case SESSION_NOT_FOUND -> HttpStatus.NOT_FOUND;
+            case SESSION_LIMIT_EXCEEDED -> HttpStatus.CONFLICT;
+        };
         return ResponseEntity.status(status)
                 .body(new ErrorResponse(ex.getReason().name(), ex.getMessage()));
     }

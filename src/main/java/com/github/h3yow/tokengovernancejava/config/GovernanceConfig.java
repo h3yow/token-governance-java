@@ -4,7 +4,10 @@ import com.github.h3yow.tokengovernancejava.authz.AccessGuard;
 import com.github.h3yow.tokengovernancejava.authz.AuthorizationService;
 import com.github.h3yow.tokengovernancejava.authz.PolicyRepository;
 import com.github.h3yow.tokengovernancejava.authz.SubjectDirectory;
+import com.github.h3yow.tokengovernancejava.session.SessionRegistry;
+import com.github.h3yow.tokengovernancejava.session.SessionService;
 import com.github.h3yow.tokengovernancejava.token.TokenService;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
@@ -29,9 +32,24 @@ public class GovernanceConfig {
     }
 
     @Bean
-    public TokenService tokenService(Clock clock) {
+    public SessionRegistry sessionRegistry(
+            Clock clock,
+            @Value("${governance.session.max-active-per-subject:5}") int maxActivePerSubject) {
+        return new SessionRegistry(maxActivePerSubject, clock);
+    }
+
+    @Bean
+    public TokenService tokenService(
+            Clock clock, SessionRegistry sessionRegistry,
+            @Value("${governance.token.replay-grace-millis:10000}") long replayGraceMillis) {
         return new TokenService(ACCESS_TTL_MILLIS, REFRESH_TTL_MILLIS,
-                CLOCK_SKEW_MILLIS, clock);
+                CLOCK_SKEW_MILLIS, replayGraceMillis, sessionRegistry, clock);
+    }
+
+    @Bean
+    public SessionService sessionService(SessionRegistry sessionRegistry,
+                                         TokenService tokenService) {
+        return new SessionService(sessionRegistry, tokenService);
     }
 
     @Bean

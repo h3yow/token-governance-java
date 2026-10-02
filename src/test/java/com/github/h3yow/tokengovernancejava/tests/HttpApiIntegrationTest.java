@@ -14,6 +14,7 @@ import org.springframework.test.web.servlet.MockMvc;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
@@ -94,5 +95,82 @@ class HttpApiIntegrationTest {
                         .content(json(checkBody)))
                 .andExpect(status().isForbidden())
                 .andExpect(jsonPath("$.error").value("REVOKED"));
+    }
+
+    @Test
+    void session_management_flow() throws Exception {
+        String user = "session-user-" + System.nanoTime();
+
+        // 1. 带设备标识签发两个会话；响应携带 sessionId
+        JsonNode phone = postJson("/api/tokens",
+                Map.of("subject", user, "device", "phone"), 200);
+        JsonNode tablet = postJson("/api/tokens",
+                Map.of("subject", user, "device", "tablet"), 200);
+        String phoneSession = phone.get("sessionId").asText();
+        String phoneAccess = phone.get("accessToken").asText();
+        String tabletAccess = tablet.get("accessToken").asText();
+
+        // 2. 会话清单：两条记录，只含元信息，不含凭证
+        String listResp = mockMvc.perform(get("/api/sessions").param("subject", user))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.length()").value(2))
+                .andReturn().getResponse().getContentAsString();
+        log.info("[HTTP] GET /api/sessions subject={} => {}", user, listResp);
+        org.junit.jupiter.api.Assertions.assertFalse(listResp.contains(phoneAccess),
+                "会话清单不得暴露访问凭证");
+
+        // 3. 单独结束 phone 会话：phone 凭证立即失效，tablet 不受影响
+        postJson("/api/sessions/end", Map.of("sessionId", phoneSession), 200);
+        Map<String, String> checkPhone = new LinkedHashMap<>();
+        checkPhone.put("accessToken", phoneAccess);
+        checkPhone.put("action", "view");
+        checkPhone.put("resource", "document");
+        mockMvc.perform(post("/api/check")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(json(checkPhone)))
+                .andExpect(status().isForbidden())
+                .andExpect(jsonPath("$.error").value("REVOKED"));
+        mockMvc.perform(post("/api/check")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(json(Map.of("accessToken", tabletAccess,
+                                "action", "view", "resource", "document"))))
+                .andExpect(status().isOk());
+        log.info("[HTTP] phone 会话已下线（403 REVOKED），tablet 会话不受影响");
+
+        // 4. 结束不存在的会话：404 SESSION_NOT_FOUND
+        mockMvc.perform(post("/api/sessions/end")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(json(Map.of("sessionId", "ghost"))))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error").value("SESSION_NOT_FOUND"));
+
+        // 5. 结束该用户全部会话
+        mockMvc.perform(post("/api/sessions/end-all")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(json(Map.of("subject", user))))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.ended").value(1));
+        mockMvc.perform(get("/api/sessions").param("subject", user))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.length()").value(0));
+        log.info("[HTTP] 全部会话已下线，清单为空");
+    }
+
+    @Test
+    void session_limit_returns_409() throws Exception {
+        String user = "limit-user-" + System.nanoTime();
+        // 默认上限 5：前 5 个成功，第 6 个明确拒绝且不挤掉旧会话
+        for (int i = 0; i < 5; i++) {
+            postJson("/api/tokens", Map.of("subject", user, "device", "dev-" + i), 200);
+        }
+        mockMvc.perform(post("/api/tokens")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(json(Map.of("subject", user, "device", "dev-5"))))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.error").value("SESSION_LIMIT_EXCEEDED"));
+        mockMvc.perform(get("/api/sessions").param("subject", user))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.length()").value(5));
+        log.info("[HTTP] 会话数上限=5，第 6 个签发被 409 SESSION_LIMIT_EXCEEDED 拒绝，旧会话保留");
     }
 }
