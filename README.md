@@ -161,7 +161,7 @@ curl -s -X POST localhost:8080/api/sessions/end-all \
 | `REVOKED` | 403 | 已被吊销（含整族连带、会话下线连带） |
 | `ALREADY_CONSUMED` | 409 | 刷新凭证已被消费：并发抢占失败（宽窗口内的再次使用） |
 | `REPLAY_DETECTED` | 409 | 刷新凭证疑似被重放：所属会话已整体作废 |
-| `SESSION_NOT_FOUND` | 404 | 会话不存在或已结束 |
+| `SESSION_NOT_FOUND` | 404 | 会话不存在或已结束（含签发时会话被并发结束） |
 | `SESSION_LIMIT_EXCEEDED` | 409 | 该用户有效会话数已达上限 |
 
 授权结论码：`PERMIT`、`DENY_EXPLICIT`、`DENY_NO_RULE`、`DENY_CONFLICT`、`DENY_SUBJECT_NOT_FOUND`。
@@ -234,6 +234,10 @@ curl -s -X POST localhost:8080/api/sessions/end-all \
 - **结束与刷新并发**：结束操作与旋转在家族锁上串行化。要么旋转先完成、随后整族
   （含刚换出的新凭证）被吊销；要么结束先生效、旋转以 `REVOKED` 被拒绝。
   两种交错下都不会出现“会话已结束却仍返回一对可用新凭证”，也不会出现“结束未生效”。
+- **结束与签发并发**：签发在家族锁内登记凭证后会复查会话状态，与整族吊销/会话结束
+  互斥。要么签发先完成、随后的结束把这对刚签发的凭证一起吊销（结束返回后即失效）；
+  要么结束先生效、本次签发作废并以 `SESSION_NOT_FOUND`（404）如实失败——已登记的
+  凭证一并吊销。两种交错下都不会出现“清单里已下线、刚拿到的凭证却还能用”。
 - **结束不存在的会话**：如实返回 `SESSION_NOT_FOUND`（404），不当作成功；
   重复结束同一会话同样报错。按用户整体下线是幂等语义，返回实际结束的会话数（可为 0）。
 - **会话数上限**：每用户同时存在的有效会话数由
@@ -258,10 +262,15 @@ curl -s -X POST localhost:8080/api/sessions/end-all \
 ### 4.4 本地验证
 
 ```bash
-mvn test          # 全部用例（含 SessionServiceTest 的 10 个会话场景）
+mvn test          # 全部用例（含 SessionServiceTest 的 12 个会话场景）
 mvn spring-boot:run
 # 然后按 2.6 节的 curl 示例走一遍：签发（带 device）→ 查清单 → 单独下线 → 全部下线
 ```
+
+手动验证“结束即失效”：签发一对凭证后立刻 `POST /api/sessions/end`，
+再用刚拿到的 accessToken 调 `/api/check`，应返回 `403 REVOKED`；
+重放验证：刷新一次后，隔 10 秒以上再用同一张旧刷新凭证调 `/api/tokens/refresh`，
+应返回 `409 REPLAY_DETECTED`，且上一步换出的新凭证随之失效（`/api/check` 返回 403）。
 
 ---
 
@@ -301,7 +310,7 @@ mvn spring-boot:run
 | 测试类 | 覆盖场景 |
 | --- | --- |
 | `TokenServiceTest` | 并发刷新（16 线程仅 1 成功）、重放、不存在、过期、**时钟偏差边界**、整族吊销、**100 轮旋转/吊销竞态** |
-| `SessionServiceTest` | 多会话并存与独立旋转、老调用方式默认会话、清单不暴露凭证、单独结束会话、按用户全部下线、结束不存在会话报错、**重放后新凭证连带失效**、宽窗口内不误判、**100 轮结束/旋转竞态**、会话数上限拒绝与释放 |
+| `SessionServiceTest` | 多会话并存与独立旋转、老调用方式默认会话、清单不暴露凭证、单独结束会话、按用户全部下线、结束不存在会话报错、**重放后新凭证连带失效**、宽窗口内不误判、**100 轮结束/旋转竞态**、**结束/签发竞态（确定性交错 + 50 轮并发压力）**、会话数上限拒绝与释放 |
 | `AuthorizationServiceTest` | 角色+属性合取、显式拒绝优先、默认拒绝、冲突拒绝、主体缺失、权限调整即时生效 |
 | `AccessGuardTest` | 凭证校验 + 实时授权端到端联动、吊销/降权/提权即时生效 |
 | `HttpApiIntegrationTest` | HTTP 全流程：签发、刷新、重放 409、不存在 404、默认拒绝、吊销 403、会话清单/单会话下线/全部下线、会话上限 409 |

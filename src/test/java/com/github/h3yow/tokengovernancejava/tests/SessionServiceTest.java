@@ -1,6 +1,7 @@
 package com.github.h3yow.tokengovernancejava.tests;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.github.h3yow.tokengovernancejava.session.LoginSession;
 import com.github.h3yow.tokengovernancejava.session.SessionException;
 import com.github.h3yow.tokengovernancejava.session.SessionRegistry;
 import com.github.h3yow.tokengovernancejava.session.SessionRejection;
@@ -14,6 +15,8 @@ import org.junit.jupiter.api.Test;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -284,6 +287,89 @@ class SessionServiceTest {
                     "会话结束后清单必须为空（第 " + round + " 轮）");
         }
         log.info("[结束竞态] 100 轮并发结束，未出现会话结束后仍可用的新凭证");
+    }
+
+    @Test
+    void end_all_racing_issue_never_returns_usable_tokens() {
+        MutableClock clock = new MutableClock(T0);
+        AtomicReference<SessionService> serviceRef = new AtomicReference<>();
+        // 确定性复现交错：签发已把会话登记进注册表、但尚未把凭证登记进家族的
+        // 窗口内，“全部下线”插进来——会话被结束、（还是空的）家族被吊销。
+        SessionRegistry registry = new SessionRegistry(5, clock) {
+            @Override
+            public LoginSession create(String subject, String deviceLabel, String sessionId,
+                                       long createdAt, long refreshExpiresAt) {
+                LoginSession s = super.create(subject, deviceLabel, sessionId,
+                        createdAt, refreshExpiresAt);
+                log.info("[签发竞态] 会话 {} 已登记，凭证尚未签发，此刻插入全部下线", sessionId);
+                serviceRef.get().endAllSessions(subject);
+                return s;
+            }
+        };
+        TokenService tokens = new TokenService(ACCESS_TTL, REFRESH_TTL, SKEW,
+                REPLAY_GRACE, registry, clock);
+        SessionService sessions = new SessionService(registry, tokens);
+        serviceRef.set(sessions);
+
+        // 结束先生效：本次签发必须如实失败，且不得留下任何可用凭证。
+        SessionException ex = assertThrows(SessionException.class,
+                () -> tokens.issue("mallory", "phone"));
+        log.info("[签发竞态] 结束与签发交错，签发被拒 reason={} msg={}",
+                ex.getReason(), ex.getMessage());
+        assertEquals(SessionRejection.SESSION_NOT_FOUND, ex.getReason(),
+                "会话已被并发结束，签发应按会话不存在/已结束拒绝");
+        assertTrue(sessions.listSessions("mallory").isEmpty(), "会话已结束，清单必须为空");
+    }
+
+    @Test
+    void issue_and_end_all_concurrently_never_leave_zombie_tokens() throws Exception {
+        // 压力交错：一个线程持续签发，另一个线程持续全部下线。
+        // 不变量：签发返回的凭证若还能用，其会话必须仍在有效清单中；
+        //         会话一旦不在清单（已结束），其凭证必须已被吊销。
+        int zombieRounds = 0;
+        for (int round = 0; round < 50; round++) {
+            Rig rig = rig(50);
+            List<TokenPair> issued = Collections.synchronizedList(new ArrayList<>());
+            Thread issuer = new Thread(() -> {
+                for (int i = 0; i < 20; i++) {
+                    try {
+                        issued.add(rig.tokens().issue("nina", "dev-" + i));
+                    } catch (SessionException ex) {
+                        // 结束先生效导致签发被拒，属于预期结果之一。
+                    }
+                }
+            });
+            Thread terminator = new Thread(() -> {
+                for (int i = 0; i < 20; i++) {
+                    rig.sessions().endAllSessions("nina");
+                }
+            });
+            issuer.start();
+            terminator.start();
+            issuer.join();
+            terminator.join();
+
+            List<SessionView> active = rig.sessions().listSessions("nina");
+            for (TokenPair pair : issued) {
+                boolean sessionAlive = active.stream()
+                        .anyMatch(v -> v.sessionId().equals(pair.accessToken().getFamilyId()));
+                if (sessionAlive) {
+                    assertEquals("nina",
+                            rig.tokens().validateAccess(pair.accessToken().getId()).subject(),
+                            "会话仍有效时凭证必须可用（第 " + round + " 轮）");
+                } else {
+                    try {
+                        expectTokenReject(RejectionReason.REVOKED,
+                                () -> rig.tokens().validateAccess(pair.accessToken().getId()));
+                    } catch (AssertionError e) {
+                        zombieRounds++;
+                        throw e;
+                    }
+                }
+            }
+        }
+        log.info("[签发竞态] 50 轮签发/全部下线并发：未出现会话已结束但凭证仍可用（zombie={}）",
+                zombieRounds);
     }
 
     @Test

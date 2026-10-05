@@ -6,7 +6,11 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
+import com.github.h3yow.tokengovernancejava.session.LoginSession;
 import com.github.h3yow.tokengovernancejava.session.SessionRegistry;
+import com.github.h3yow.tokengovernancejava.session.SessionRejection;
+import com.github.h3yow.tokengovernancejava.session.SessionException;
+import com.github.h3yow.tokengovernancejava.session.SessionState;
 
 /**
  * 凭证生命周期服务：签发、刷新旋转、校验、吊销。
@@ -15,8 +19,8 @@ import com.github.h3yow.tokengovernancejava.session.SessionRegistry;
  * <ol>
  *   <li>刷新凭证状态的 {@code compareAndSet}：同一刷新凭证在并发下最多成功旋转一次，
  *       抢到 ACTIVE -> CONSUMED 的线程才继续，其余线程一律拒绝；</li>
- *   <li>刷新家族级互斥：旋转（登记新成员）与整族吊销互斥，杜绝“吊销刚发生、旋转仍返回
- *       新有效凭证”的短暂越权窗口。</li>
+ *   <li>刷新家族级互斥：签发/旋转（登记新成员）与整族吊销互斥，且登记后复查会话
+ *       与新成员状态，杜绝“吊销刚发生、仍返回新有效凭证”的短暂越权窗口。</li>
  * </ol>
  *
  * <p>会话集成：每个刷新家族即一个登录会话（familyId 即 sessionId）。签发时在
@@ -97,7 +101,8 @@ public class TokenService {
      *
      * @param deviceLabel 设备/来源标识；为空时使用 default（兼容老调用方式）
      * @throws com.github.h3yow.tokengovernancejava.session.SessionException
-     *         该用户有效会话数已达上限时明确拒绝
+     *         该用户有效会话数已达上限时明确拒绝；会话被并发的结束操作抢先结束时，
+     *         本次签发作废（已登记的凭证一并吊销），绝不返回可用凭证
      */
     public TokenPair issue(String subject, String deviceLabel) {
         if (subject == null || subject.isBlank()) {
@@ -111,6 +116,15 @@ public class TokenService {
         Token refresh = createToken(TokenType.REFRESH, subject, familyId, ts, refreshTtlMillis);
         synchronized (lockFor(familyId)) {
             register(familyId, access, refresh);
+            // 复查：登记新凭证与整族吊销/会话结束互斥。若并发的结束操作先生效
+            // （吊销发生在凭证登记之前，会话已 ENDED），刚登记的凭证必须立即
+            // 整族作废，绝不把“会话已结束但凭证仍可用”的凭证对返回给调用方。
+            LoginSession session = sessionRegistry.get(familyId);
+            if (session == null || session.getState() != SessionState.ACTIVE) {
+                revokeFamilyLocked(familyId);
+                throw new SessionException(SessionRejection.SESSION_NOT_FOUND,
+                        "会话已被并发结束，本次签发作废: " + familyId);
+            }
         }
         return new TokenPair(access, refresh);
     }
