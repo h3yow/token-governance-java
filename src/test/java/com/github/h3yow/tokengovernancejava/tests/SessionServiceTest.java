@@ -1,6 +1,7 @@
 package com.github.h3yow.tokengovernancejava.tests;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.github.h3yow.tokengovernancejava.session.LoginSession;
 import com.github.h3yow.tokengovernancejava.session.SessionException;
 import com.github.h3yow.tokengovernancejava.session.SessionRegistry;
 import com.github.h3yow.tokengovernancejava.session.SessionRejection;
@@ -14,7 +15,11 @@ import org.junit.jupiter.api.Test;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.time.Clock;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -314,5 +319,154 @@ class SessionServiceTest {
         assertEquals(2, rig.sessions().listSessions("kate").stream()
                 .filter(v -> !v.expired()).count(), "到期会话不应占用上限名额");
         log.info("[上限] 旧会话到期后释放名额，新会话签发成功");
+    }
+
+    /**
+     * 可插闩的注册表：把“会话已登记、凭证尚未登记进家族”的窗口固定下来，
+     * 让结束操作确定性地落进这个窗口，复现签发与结束的竞态。
+     */
+    private static final class LatchingRegistry extends SessionRegistry {
+        private final CountDownLatch sessionRegistered = new CountDownLatch(1);
+        private final CountDownLatch proceedRegister = new CountDownLatch(1);
+        private final CountDownLatch sessionEnded = new CountDownLatch(1);
+        private volatile String createdSessionId;
+
+        LatchingRegistry(int maxActivePerSubject, Clock clock) {
+            super(maxActivePerSubject, clock);
+        }
+
+        @Override
+        public LoginSession create(String subject, String deviceLabel, String sessionId,
+                                   long createdAt, long refreshExpiresAt) {
+            LoginSession session =
+                    super.create(subject, deviceLabel, sessionId, createdAt, refreshExpiresAt);
+            createdSessionId = sessionId;
+            sessionRegistered.countDown();
+            awaitQuietly(proceedRegister);
+            return session;
+        }
+
+        @Override
+        public boolean markEnded(String sessionId) {
+            boolean result = super.markEnded(sessionId);
+            if (result) {
+                sessionEnded.countDown();
+            }
+            return result;
+        }
+
+        private static void awaitQuietly(CountDownLatch latch) {
+            try {
+                if (!latch.await(10, TimeUnit.SECONDS)) {
+                    throw new IllegalStateException("等待闩超时");
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException(e);
+            }
+        }
+    }
+
+    private record LatchedRig(MutableClock clock, LatchingRegistry registry,
+                              TokenService tokens, SessionService sessions) {
+    }
+
+    private LatchedRig latchedRig() {
+        MutableClock clock = new MutableClock(T0);
+        LatchingRegistry registry = new LatchingRegistry(5, clock);
+        TokenService tokens = new TokenService(ACCESS_TTL, REFRESH_TTL, SKEW,
+                REPLAY_GRACE, registry, clock);
+        return new LatchedRig(clock, registry, tokens, new SessionService(registry, tokens));
+    }
+
+    /** 启动一个签发线程，并把结束操作确定性地插进“会话已登记、凭证未登记”的窗口。 */
+    private void runIssueVsEnd(LatchedRig rig, Runnable endAction, String tag) throws Exception {
+        AtomicReference<TokenPair> issued = new AtomicReference<>();
+        AtomicReference<TokenException> issueError = new AtomicReference<>();
+        Thread issuer = new Thread(() -> {
+            try {
+                issued.set(rig.tokens().issue("amy", "phone"));
+            } catch (TokenException ex) {
+                issueError.set(ex);
+            }
+        });
+        issuer.start();
+        assertTrue(rig.registry().sessionRegistered.await(5, TimeUnit.SECONDS),
+                "会话应已登记进注册表（" + tag + "）");
+
+        Thread ender = new Thread(endAction);
+        ender.start();
+        assertTrue(rig.registry().sessionEnded.await(5, TimeUnit.SECONDS),
+                "结束操作应已生效（会话状态跃迁）（" + tag + "）");
+        // 放行签发线程：把凭证登记进一个“已被结束”的会话名下。
+        rig.registry().proceedRegister.countDown();
+        issuer.join(5_000L);
+        ender.join(5_000L);
+
+        assertTrue(rig.sessions().listSessions("amy").isEmpty(),
+                "会话结束后清单必须为空（" + tag + "）");
+        if (issued.get() != null) {
+            // 签发返回了凭证：会话既已结束，下一次使用必须被拒。
+            expectTokenReject(RejectionReason.REVOKED,
+                    () -> rig.tokens().validateAccess(issued.get().accessToken().getId()));
+            expectTokenReject(RejectionReason.REVOKED,
+                    () -> rig.tokens().rotate(issued.get().refreshToken().getId()));
+            log.info("[{}] 签发先完成，但结束已生效：刚签发的 access/refresh 均被拒 reason=REVOKED", tag);
+        } else {
+            // 结束先生效：签发必须被拒绝，不能返回可用凭证。
+            assertEquals(RejectionReason.REVOKED, issueError.get().getReason(),
+                    "签发应被拒绝且原因可区分（" + tag + "）");
+            log.info("[{}] 结束先生效，签发被拒绝 reason={}", tag, issueError.get().getReason());
+        }
+    }
+
+    @Test
+    void end_all_racing_issue_never_leaves_usable_tokens() throws Exception {
+        LatchedRig rig = latchedRig();
+        AtomicInteger ended = new AtomicInteger();
+        runIssueVsEnd(rig, () -> ended.set(rig.sessions().endAllSessions("amy")), "签发竞态-全部下线");
+        assertEquals(1, ended.get(), "整体下线必须如实生效：结束会话数=1");
+        log.info("[签发竞态-全部下线] 结束操作返回 ended=1，不存在“看似成功实际未生效”");
+    }
+
+    @Test
+    void end_single_session_racing_issue_never_leaves_usable_tokens() throws Exception {
+        LatchedRig rig = latchedRig();
+        runIssueVsEnd(rig,
+                () -> rig.sessions().endSession(rig.registry().createdSessionId),
+                "签发竞态-单会话下线");
+    }
+
+    @Test
+    void issue_and_end_all_stress_invariant() throws Exception {
+        for (int round = 0; round < 100; round++) {
+            Rig rig = rig(5);
+            AtomicReference<TokenPair> issued = new AtomicReference<>();
+            AtomicReference<TokenException> issueError = new AtomicReference<>();
+            Thread issuer = new Thread(() -> {
+                try {
+                    issued.set(rig.tokens().issue("sam", "phone"));
+                } catch (TokenException ex) {
+                    issueError.set(ex);
+                }
+            });
+            Thread ender = new Thread(() -> rig.sessions().endAllSessions("sam"));
+            issuer.start();
+            ender.start();
+            issuer.join();
+            ender.join();
+
+            if (issued.get() != null) {
+                String sessionId = issued.get().accessToken().getFamilyId();
+                boolean stillActive = rig.sessions().listSessions("sam").stream()
+                        .anyMatch(v -> v.sessionId().equals(sessionId));
+                if (!stillActive) {
+                    // 会话已被结束：它名下的凭证下一次使用必须被拒。
+                    expectTokenReject(RejectionReason.REVOKED,
+                            () -> rig.tokens().validateAccess(issued.get().accessToken().getId()));
+                }
+            }
+        }
+        log.info("[签发竞态-压测] 100 轮并发签发/全部下线，未出现已结束会话仍可用凭证");
     }
 }

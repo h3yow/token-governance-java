@@ -202,6 +202,9 @@ curl -s -X POST localhost:8080/api/sessions/end-all \
 - **旋转 / 吊销互斥**：同一家族上加锁，旋转“登记新成员”与“整族吊销”互斥；
   旋转在返回新凭证前会复查新成员状态，保证吊销刚发生时不会返回一对仍有效的新凭证，
   消除吊销竞态下的短暂越权窗口。
+- **签发 / 结束互斥**：签发时“登记会话 + 登记凭证”在同一家族锁临界区内完成，
+  登记后复查会话状态；若会话在签发过程中被并发结束，立即补偿吊销并以 `REVOKED`
+  拒绝本次签发，已结束会话名下绝不残留可用凭证（详见 4.2）。
 
 ### 3.1 时钟偏差容忍
 
@@ -231,9 +234,16 @@ curl -s -X POST localhost:8080/api/sessions/end-all \
 
 ### 4.2 边界与并发语义
 
+- **结束与签发并发**：签发方把“登记会话 + 登记凭证”放在同一家族锁临界区内，
+  并在登记后复查会话状态。两种交错只有两种结果：要么签发先完成、随后的结束
+  把刚签发的凭证一并吊销（下一次使用即 `REVOKED`）；要么结束先生效、签发以
+  `REVOKED` 被拒绝。绝不会出现“清单里已看不到该会话、刚签发的凭证却还能用”，
+  也不会出现“结束返回成功但实际未生效”。
 - **结束与刷新并发**：结束操作与旋转在家族锁上串行化。要么旋转先完成、随后整族
   （含刚换出的新凭证）被吊销；要么结束先生效、旋转以 `REVOKED` 被拒绝。
   两种交错下都不会出现“会话已结束却仍返回一对可用新凭证”，也不会出现“结束未生效”。
+  结束操作一旦返回，该会话名下所有凭证（含旧凭证）的下一次使用必被拒，
+  不存在“结束刚返回、旧凭证短暂还能用”的窗口。
 - **结束不存在的会话**：如实返回 `SESSION_NOT_FOUND`（404），不当作成功；
   重复结束同一会话同样报错。按用户整体下线是幂等语义，返回实际结束的会话数（可为 0）。
 - **会话数上限**：每用户同时存在的有效会话数由
@@ -258,10 +268,23 @@ curl -s -X POST localhost:8080/api/sessions/end-all \
 ### 4.4 本地验证
 
 ```bash
-mvn test          # 全部用例（含 SessionServiceTest 的 10 个会话场景）
+mvn test          # 全部用例（含 SessionServiceTest 的 13 个会话场景）
 mvn spring-boot:run
 # 然后按 2.6 节的 curl 示例走一遍：签发（带 device）→ 查清单 → 单独下线 → 全部下线
 ```
+
+并发与重放类行为由自动化测试稳定复现，日志会打印每个用例的输入与判定依据：
+
+- `SessionServiceTest#end_all_racing_issue_never_leaves_usable_tokens` /
+  `end_single_session_racing_issue_never_leaves_usable_tokens`：
+  用插闩注册表把“会话已登记、凭证未登记”的窗口固定下来，确定性验证结束与签发竞态；
+- `SessionServiceTest#issue_and_end_all_stress_invariant`：100 轮并发签发/全部下线压测；
+- `SessionServiceTest#end_session_racing_rotate_never_leaves_usable_tokens`：
+  100 轮结束/旋转竞态；
+- `SessionServiceTest#replayed_refresh_kills_whole_session_including_rotated_tokens` /
+  `consumed_within_grace_window_is_not_treated_as_replay`：事后重放株连会话、
+  宽窗口内不误判；
+- `TokenServiceTest`：16 线程并发刷新仅 1 次成功、100 轮旋转/吊销竞态。
 
 ---
 
@@ -301,7 +324,7 @@ mvn spring-boot:run
 | 测试类 | 覆盖场景 |
 | --- | --- |
 | `TokenServiceTest` | 并发刷新（16 线程仅 1 成功）、重放、不存在、过期、**时钟偏差边界**、整族吊销、**100 轮旋转/吊销竞态** |
-| `SessionServiceTest` | 多会话并存与独立旋转、老调用方式默认会话、清单不暴露凭证、单独结束会话、按用户全部下线、结束不存在会话报错、**重放后新凭证连带失效**、宽窗口内不误判、**100 轮结束/旋转竞态**、会话数上限拒绝与释放 |
+| `SessionServiceTest` | 多会话并存与独立旋转、老调用方式默认会话、清单不暴露凭证、单独结束会话、按用户全部下线、结束不存在会话报错、**重放后新凭证连带失效**、宽窗口内不误判、**100 轮结束/旋转竞态**、**结束/签发竞态（插闩确定性复现 + 100 轮压测）**、会话数上限拒绝与释放 |
 | `AuthorizationServiceTest` | 角色+属性合取、显式拒绝优先、默认拒绝、冲突拒绝、主体缺失、权限调整即时生效 |
 | `AccessGuardTest` | 凭证校验 + 实时授权端到端联动、吊销/降权/提权即时生效 |
 | `HttpApiIntegrationTest` | HTTP 全流程：签发、刷新、重放 409、不存在 404、默认拒绝、吊销 403、会话清单/单会话下线/全部下线、会话上限 409 |

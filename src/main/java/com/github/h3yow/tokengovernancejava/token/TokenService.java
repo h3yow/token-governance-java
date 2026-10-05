@@ -7,16 +7,20 @@ import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
 import com.github.h3yow.tokengovernancejava.session.SessionRegistry;
+import com.github.h3yow.tokengovernancejava.session.SessionState;
 
 /**
  * 凭证生命周期服务：签发、刷新旋转、校验、吊销。
  *
- * <p>线程安全。并发正确性由两层机制保证：</p>
+ * <p>线程安全。并发正确性由三层机制保证：</p>
  * <ol>
  *   <li>刷新凭证状态的 {@code compareAndSet}：同一刷新凭证在并发下最多成功旋转一次，
  *       抢到 ACTIVE -> CONSUMED 的线程才继续，其余线程一律拒绝；</li>
  *   <li>刷新家族级互斥：旋转（登记新成员）与整族吊销互斥，杜绝“吊销刚发生、旋转仍返回
- *       新有效凭证”的短暂越权窗口。</li>
+ *       新有效凭证”的短暂越权窗口；</li>
+ *   <li>签发与结束互斥：会话登记与凭证登记在同一家族锁临界区内完成，登记后复查会话
+ *       状态；若结束操作在登记过程中先生效（当时家族为空、吊销落空），立即补偿吊销并
+ *       拒绝签发，杜绝“会话已下线、刚签发的凭证却还能用”。</li>
  * </ol>
  *
  * <p>会话集成：每个刷新家族即一个登录会话（familyId 即 sessionId）。签发时在
@@ -95,9 +99,16 @@ public class TokenService {
     /**
      * 为主体签发一对全新凭证，并建立对应登录会话。
      *
+     * <p>会话登记与凭证登记在同一个家族锁临界区内完成，与整族吊销互斥；
+     * 登记后复查会话状态：若结束操作恰在登记过程中生效（当时家族为空、
+     * 吊销落空），立即补偿吊销并拒绝本次签发。两种交错下都不会出现
+     * “会话已结束、刚签发的凭证却还能用”。</p>
+     *
      * @param deviceLabel 设备/来源标识；为空时使用 default（兼容老调用方式）
      * @throws com.github.h3yow.tokengovernancejava.session.SessionException
      *         该用户有效会话数已达上限时明确拒绝
+     * @throws TokenException 会话在签发过程中被并发结束时以
+     *         {@link RejectionReason#REVOKED} 拒绝，本次签发的凭证一并作废
      */
     public TokenPair issue(String subject, String deviceLabel) {
         if (subject == null || subject.isBlank()) {
@@ -105,12 +116,19 @@ public class TokenService {
         }
         long ts = now();
         String familyId = UUID.randomUUID().toString();
-        // 先登记会话（可能因数量上限被拒绝），再签发凭证，避免超发。
-        sessionRegistry.create(subject, deviceLabel, familyId, ts, ts + refreshTtlMillis);
         Token access = createToken(TokenType.ACCESS, subject, familyId, ts, accessTtlMillis);
         Token refresh = createToken(TokenType.REFRESH, subject, familyId, ts, refreshTtlMillis);
         synchronized (lockFor(familyId)) {
+            // 先登记会话（可能因数量上限被拒绝），再登记凭证，避免超发。
+            sessionRegistry.create(subject, deviceLabel, familyId, ts, ts + refreshTtlMillis);
             register(familyId, access, refresh);
+            // 复查：若并发结束在凭证登记前已生效（当时家族为空、吊销落空），
+            // 在这里补偿吊销，保证已结束会话名下绝不存在可用凭证。
+            if (sessionRegistry.get(familyId).getState() == SessionState.ENDED) {
+                revokeFamilyLocked(familyId);
+                throw new TokenException(RejectionReason.REVOKED,
+                        "会话在签发过程中已被结束，本次签发的凭证一并作废");
+            }
         }
         return new TokenPair(access, refresh);
     }
